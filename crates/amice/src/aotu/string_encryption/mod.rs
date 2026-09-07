@@ -10,16 +10,20 @@ use amice_macro::amice;
 use amice_plugin::inkwell::llvm_sys::prelude::LLVMValueRef;
 use amice_plugin::inkwell::module::Module;
 use amice_plugin::inkwell::values::{
-    AnyValueEnum, ArrayValue, AsValueRef, BasicValue, GlobalValue, InstructionOpcode, InstructionValue, PointerValue,
-    StructValue,
+    AnyValueEnum, ArrayValue, AsValueRef, BasicValue, BasicValueEnum, GlobalValue, InstructionOpcode, InstructionValue,
+    PointerValue, StructValue,
 };
 use amice_plugin::{LlvmModulePass, ModuleAnalysisManager, PreservedAnalyses, inkwell};
-use inkwell::llvm_sys::core::LLVMGetAsString;
+use inkwell::llvm_sys::core::{
+    LLVMGetAsString, LLVMGetFirstUse, LLVMGetNextUse, LLVMGetUser, LLVMIsAConstantArray, LLVMIsAConstantExpr,
+    LLVMIsAConstantStruct, LLVMIsAGlobalVariable, LLVMIsAInstruction, LLVMIsGlobalConstant, LLVMIsThreadLocal,
+};
 use std::ptr::NonNull;
 
 /// Stack allocation threshold: strings larger than this will use global timing
 /// even when stack allocation is enabled
 const STACK_ALLOC_THRESHOLD: u32 = 4096; // 4KB
+const MAX_STRING_BYTES: usize = 65_536;
 
 #[amice(
     priority = 1000,
@@ -46,6 +50,9 @@ impl AmicePass for StringEncryption {
         if !self.default_config.enable {
             return Ok(PreservedAnalyses::All);
         }
+        if self.default_config.stack_alloc {
+            anyhow::bail!("string stack allocation cannot preserve Rust static pointer lifetimes");
+        }
 
         let mut algo: Box<dyn StringEncryptionAlgo> = match self.default_config.algorithm {
             StringAlgorithm::Xor => Box::new(XorAlgo::default()),
@@ -61,6 +68,8 @@ impl AmicePass for StringEncryption {
             error!("do_string_encrypt failed: {}", err);
             return Ok(PreservedAnalyses::All);
         }
+
+        clear_string_effect_attributes(module);
 
         for x in module.get_functions() {
             if let VerifyResult::Broken(err) = x.verify_function() {
@@ -82,6 +91,7 @@ pub(super) trait StringEncryptionAlgo {
 struct EncryptedGlobalValue<'a> {
     global: GlobalValue<'a>,
     str_len: u32,
+    xor_mask: u8,
     flag: Option<GlobalValue<'a>>,
     #[allow(dead_code)]
     oneshot: bool,
@@ -111,6 +121,7 @@ impl<'a> EncryptedGlobalValue<'a> {
         EncryptedGlobalValue {
             global,
             str_len: len,
+            xor_mask: 0,
             flag,
             oneshot: false,
             use_stack_alloc,
@@ -139,6 +150,7 @@ impl<'a> EncryptedGlobalValue<'a> {
         EncryptedGlobalValue {
             global,
             str_len: len,
+            xor_mask: 0,
             flag,
             oneshot: false,
             use_stack_alloc,
@@ -199,106 +211,234 @@ pub(crate) fn array_as_const_string<'a>(arr: &'a ArrayValue) -> Option<&'a [u8]>
     }
 }
 
-pub(crate) fn collect_insert_points<'a>(
-    string_global: GlobalValue,
-    user: AnyValueEnum<'a>,
-    output: &mut Vec<(LLVMValueRef, u32)>,
-) -> anyhow::Result<()> {
-    use std::collections::HashSet;
+struct StringCandidate<'a> {
+    global: GlobalValue<'a>,
+    bytes: Vec<u8>,
+    users: Vec<(LLVMValueRef, u32)>,
+}
 
-    // visited: 按 ValueRef 去重，避免重复与潜在环
-    let mut visited = HashSet::new();
-    let mut worklist = vec![user.as_value_ref()];
+fn local_data_global(global: GlobalValue<'_>) -> bool {
+    use inkwell::module::Linkage;
+    matches!(global.get_linkage(), Linkage::Internal | Linkage::Private)
+        && unsafe { LLVMIsThreadLocal(global.as_value_ref()) == 0 }
+        && !global.get_name().to_bytes().starts_with(b"llvm.")
+}
 
-    while let Some(curr_ptr) = worklist.pop() {
-        // 如果已访问，继续
-        if !visited.insert(curr_ptr) {
-            continue;
+fn prepare_string_insertion(inst: InstructionValue<'_>) -> anyhow::Result<InstructionValue<'_>> {
+    use inkwell::attributes::{Attribute, AttributeLoc};
+    let block = inst
+        .get_parent()
+        .ok_or_else(|| anyhow::anyhow!("detached string user"))?;
+    let function = block
+        .get_parent()
+        .ok_or_else(|| anyhow::anyhow!("string user without function"))?;
+    // rustc may have inferred read-only/no-sync behavior before this pass adds
+    // atomic initialization and shared-buffer writes.
+    for name in ["memory", "readnone", "readonly", "nosync", "speculatable"] {
+        let kind = Attribute::get_named_enum_kind_id(name);
+        if kind != 0 {
+            function.remove_enum_attribute(AttributeLoc::Function, kind);
         }
+    }
+    Ok(if inst.get_opcode() == InstructionOpcode::Phi {
+        block.get_first_insertion_pt()
+    } else {
+        inst
+    })
+}
 
-        // 通过 ValueRef 还原为 AnyValueEnum
-        let curr = unsafe { AnyValueEnum::new(curr_ptr) };
-
-        // 如果能解析到“指令”层面，就在该指令上找操作数
-        // 否则（常见于 PointerValue/ArrayValue 非 instruction 值），
-        // 沿着 use 链继续向上游 user 追溯，直到遇到指令为止
-        let mut target_inst: Option<InstructionValue<'a>> = None;
-
-        match curr {
-            AnyValueEnum::InstructionValue(inst) => {
-                target_inst = Some(inst);
-            },
-            AnyValueEnum::IntValue(v) => {
-                if let Some(inst) = v.as_instruction_value() {
-                    target_inst = Some(inst);
-                } else {
-                    error!("(strenc) unexpected IntValue user: {v:?}");
-                }
-            },
-            AnyValueEnum::PointerValue(v) => {
-                if let Some(inst) = v.as_instruction_value() {
-                    target_inst = Some(inst);
-                } else {
-                    let mut found = false;
-                    let mut use_opt = v.get_first_use();
-                    while let Some(u) = use_opt {
-                        use_opt = u.get_next_use();
-                        found = true;
-                        debug!("{:?}", u.get_user());
-                        worklist.push(u.get_user().as_value_ref());
-                    }
-                    if !found {
-                        error!("(strenc) unexpected PointerValue user (no uses): {v:?}");
-                    }
-                }
-            },
-            AnyValueEnum::ArrayValue(v) => {
-                let mut found = false;
-                let mut use_opt = v.get_first_use();
-                while let Some(u) = use_opt {
-                    use_opt = u.get_next_use();
-                    found = true;
-                    worklist.push(u.get_user().as_value_ref());
-                }
-                if !found {
-                    error!("(strenc) unexpected ArrayValue user (no uses): {v:?}");
-                }
-            },
-            AnyValueEnum::StructValue(v) => {
-                // %3 = call { ptr, i64 } @_ZN3fmt3v1112vformat_to_nIPcJETnNSt9enable_ifIXsr6detail18is_output_iteratorIT_cEE5valueEiE4typeELi0EEENS0_18format_to_n_resultIS4_EES4_mNS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE(ptr noundef nonnull %2, i64 noundef 1023, ptr nonnull @.str, i64 2, i64 12, ptr nonnull %1)
-                // { ptr, i64 } 是一个匿名结构体类型，包含两个字段：
-                // 调用这个函数返回匿名结构体，很明显这个是一条指令，但是没有走InstructionValue！为什么呢？
-                // 因为inkwell的安全封装设计，解决办法旧很简单了，直接复用inst的逻辑，llvm兜底
-                // ---- 作为指令：它是一条 call 指令（Instruction）
-                // ---- 作为值：它产生一个 { ptr, i64 } 类型的值（Value）
-                if let Some(inst) = v.as_instruction_value() {
-                    target_inst = Some(inst);
-                } else {
-                    error!("(strenc) unexpected StructValue user: {v:?}");
-                }
-            },
-            // 其他类型：目前未覆盖，打印日志
-            _ => error!("(strenc) unexpected user type: {curr:?}"),
-        }
-
-        // 在找到的目标指令上遍历其操作数，定位引用到目标全局的操作数索引
-        if let Some(inst) = target_inst {
-            for i in 0..inst.get_num_operands() {
-                if let Some(op) = inst.get_operand(i) {
-                    if let Some(operand) = op.value() {
-                        // 只收集直接引用的插入点
-                        if operand.as_value_ref() == string_global.as_value_ref() {
-                            output.push((inst.as_value_ref() as _, i));
+fn clear_string_effect_attributes(module: &Module<'_>) {
+    use inkwell::attributes::{Attribute, AttributeLoc};
+    use inkwell::llvm_sys::core::LLVMRemoveCallSiteEnumAttribute;
+    for function in module
+        .get_functions()
+        .filter(|function| function.count_basic_blocks() != 0)
+    {
+        for name in ["memory", "readnone", "readonly", "nosync", "speculatable"] {
+            let kind = Attribute::get_named_enum_kind_id(name);
+            if kind == 0 {
+                continue;
+            }
+            function.remove_enum_attribute(AttributeLoc::Function, kind);
+            for block in function.get_basic_blocks() {
+                for inst in block.get_instructions() {
+                    if matches!(
+                        inst.get_opcode(),
+                        InstructionOpcode::Call | InstructionOpcode::Invoke | InstructionOpcode::CallBr
+                    ) {
+                        unsafe {
+                            LLVMRemoveCallSiteEnumAttribute(inst.as_value_ref(), u32::MAX, kind);
                         }
                     }
                 }
             }
         }
     }
-
-    Ok(())
 }
 
+fn has_unsupported_string_control_flow(function: inkwell::values::FunctionValue<'_>) -> bool {
+    for block in function.get_basic_blocks() {
+        for inst in block.get_instructions() {
+            if matches!(
+                inst.get_opcode(),
+                InstructionOpcode::Invoke
+                    | InstructionOpcode::LandingPad
+                    | InstructionOpcode::CatchPad
+                    | InstructionOpcode::CleanupPad
+                    | InstructionOpcode::CatchSwitch
+                    | InstructionOpcode::CatchRet
+                    | InstructionOpcode::CleanupRet
+                    | InstructionOpcode::Resume
+                    | InstructionOpcode::CallBr
+            ) {
+                return true;
+            }
+            if inst.get_opcode() == InstructionOpcode::Call
+                && unsafe { inkwell::llvm_sys::core::LLVMGetTailCallKind(inst.as_value_ref()) }
+                    == inkwell::llvm_sys::LLVMTailCallKind::LLVMTailCallKindMustTail
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Binary payloads have real backing arrays in the reserved section. A Rust
+/// fat-pointer's inline byte fields are never treated as standalone strings.
+fn collect_string_candidates<'a>(module: &Module<'a>, cfg: &StringEncryptionConfig) -> Vec<StringCandidate<'a>> {
+    let mut candidates = Vec::new();
+    for global in module.get_globals() {
+        if !local_data_global(global) || unsafe { LLVMIsGlobalConstant(global.as_value_ref()) == 0 } {
+            continue;
+        }
+        if let Some(section) = global.get_section() {
+            // Respect explicit storage sections, including .delta.no_obfuscate
+            // and read-only/custom sections that cannot support writeback.
+            if !section.to_bytes().is_empty() {
+                info!("(strenc) skipped {:?}: explicit data section", global.get_name());
+                continue;
+            }
+        }
+        if cfg.only_dot_str && !global.get_name().to_str().is_ok_and(|name| name.contains(".str")) {
+            continue;
+        }
+        let Some(BasicValueEnum::ArrayValue(array)) = global.get_initializer() else {
+            continue;
+        };
+        if !array.is_const_string() || array.is_undef() || array.is_null() {
+            continue;
+        }
+        let Some(bytes) = array_as_const_string(&array) else {
+            continue;
+        };
+        let text = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+        if bytes.len() <= 1
+            || bytes.len() > MAX_STRING_BYTES
+            || std::str::from_utf8(text).is_err()
+            || text
+                .iter()
+                .any(|byte| byte.is_ascii_control() && !matches!(byte, b'\n' | b'\r' | b'\t'))
+        {
+            info!("(strenc) skipped {:?}: not a supported text array", global.get_name());
+            continue;
+        }
+        let mut users = Vec::new();
+        if cfg.timing == StringDecryptTiming::Lazy {
+            let mut use_value = global.get_first_use();
+            let mut complete = true;
+            while let Some(current) = use_value {
+                use_value = current.get_next_use();
+                if collect_insert_points(global, current.get_user(), &mut users).is_err() {
+                    complete = false;
+                    break;
+                }
+            }
+            if !complete || users.is_empty() {
+                info!(
+                    "(strenc) skipped {:?}: unsupported or unguarded use chain",
+                    global.get_name()
+                );
+                continue;
+            }
+            users.sort_unstable_by_key(|(value, operand)| (*value as usize, *operand));
+            users.dedup();
+        }
+        candidates.push(StringCandidate {
+            global,
+            bytes: bytes.to_vec(),
+            users,
+        });
+    }
+    candidates
+}
+
+pub(crate) fn collect_insert_points<'a>(
+    _string_global: GlobalValue,
+    user: AnyValueEnum<'a>,
+    output: &mut Vec<(LLVMValueRef, u32)>,
+) -> anyhow::Result<()> {
+    use inkwell::llvm_sys::LLVMLinkage;
+    use inkwell::llvm_sys::core::{LLVMGetLinkage, LLVMGetSection};
+
+    let mut visited = std::collections::HashSet::new();
+    let mut worklist = vec![user.as_value_ref()];
+    while let Some(value) = worklist.pop() {
+        if !visited.insert(value) {
+            continue;
+        }
+        // Guard the first runtime instruction on each constant-use path.
+        // Guarding a load of a Rust slice also covers escaped/returned pointers.
+        if !unsafe { LLVMIsAInstruction(value) }.is_null() {
+            let instruction = value.into_instruction_value();
+            if matches!(
+                instruction.get_opcode(),
+                InstructionOpcode::LandingPad | InstructionOpcode::CatchPad | InstructionOpcode::CleanupPad
+            ) {
+                anyhow::bail!("exception-pad string use cannot be guarded");
+            }
+            let block = instruction
+                .get_parent()
+                .ok_or_else(|| anyhow::anyhow!("detached string user"))?;
+            let function = block
+                .get_parent()
+                .ok_or_else(|| anyhow::anyhow!("string user has no parent function"))?;
+            if has_unsupported_string_control_flow(function) {
+                anyhow::bail!("string use in EH/funclet/musttail function cannot be guarded");
+            }
+            output.push((value, 0));
+            continue;
+        }
+        if !unsafe { LLVMIsAGlobalVariable(value) }.is_null() {
+            let linkage = unsafe { LLVMGetLinkage(value) };
+            let section = unsafe { LLVMGetSection(value) };
+            let has_section = !section.is_null() && !unsafe { std::ffi::CStr::from_ptr(section) }.to_bytes().is_empty();
+            if !matches!(
+                linkage,
+                LLVMLinkage::LLVMInternalLinkage | LLVMLinkage::LLVMPrivateLinkage
+            ) || unsafe { LLVMIsThreadLocal(value) != 0 }
+                || has_section
+            {
+                anyhow::bail!("string escapes through an external, TLS, or sectioned global");
+            }
+        } else if unsafe {
+            LLVMIsAConstantExpr(value).is_null()
+                && LLVMIsAConstantStruct(value).is_null()
+                && LLVMIsAConstantArray(value).is_null()
+        } {
+            anyhow::bail!("unsupported constant string user");
+        }
+        let mut next_use = unsafe { LLVMGetFirstUse(value) };
+        if next_use.is_null() {
+            anyhow::bail!("string constant chain has no guarded runtime use");
+        }
+        while !next_use.is_null() {
+            worklist.push(unsafe { LLVMGetUser(next_use) });
+            next_use = unsafe { LLVMGetNextUse(next_use) };
+        }
+    }
+    Ok(())
+}
 fn alloc_stack_string<'a>(
     module: &mut Module<'a>,
     string: EncryptedGlobalValue,

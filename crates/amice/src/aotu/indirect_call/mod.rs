@@ -12,6 +12,7 @@ use amice_plugin::inkwell::values::{
     AsValueRef, BasicValue, CallSiteValue, FunctionValue, GlobalValue, InstructionOpcode, InstructionValue,
 };
 use amice_plugin::{LlvmModulePass, ModuleAnalysisManager, PreservedAnalyses};
+use rand::prelude::SliceRandom;
 
 #[amice(
     priority = 990,
@@ -111,6 +112,8 @@ impl AmicePass for IndirectCall {
         let i32_type = ctx.i32_type();
         let ptr_type = ptr_type!(ctx, i8_type);
 
+        // Call-site indices below are resolved from this same randomized order.
+        likely_functions.shuffle(&mut rand::rng());
         let likely_functions_values = likely_functions
             .iter()
             .map(|f| f.as_global_value())

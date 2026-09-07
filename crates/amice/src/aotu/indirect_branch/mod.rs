@@ -1,7 +1,7 @@
 use crate::config::{Config, IndirectBranchConfig, IndirectBranchFlags};
 use crate::pass_registry::{AmiceFunctionPass, AmicePass, AmicePassFlag};
 use amice_llvm::const_array;
-use amice_llvm::inkwell2::{BasicBlockExt, BuilderExt, FunctionExt, InstructionExt, ModuleExt};
+use amice_llvm::inkwell2::{BasicBlockExt, BuilderExt, FunctionExt, InstructionExt, ModuleExt, VerifyResult};
 use amice_llvm::ptr_type;
 use amice_macro::amice;
 use amice_plugin::inkwell::basic_block::BasicBlock;
@@ -55,6 +55,38 @@ impl AmicePass for IndirectBranch {
                 continue;
             }
 
+            if x.count_basic_blocks() < 3 {
+                log::info!("(IndirectBranch) skipping {:?}: fewer than two non-entry destinations", x.get_name());
+                continue;
+            }
+            if x.get_basic_blocks().iter().any(|block| {
+                block.get_instructions().any(|inst| {
+                    matches!(
+                        inst.get_opcode(),
+                        InstructionOpcode::Invoke
+                            | InstructionOpcode::LandingPad
+                            | InstructionOpcode::CatchSwitch
+                            | InstructionOpcode::CatchPad
+                            | InstructionOpcode::CatchRet
+                            | InstructionOpcode::CleanupPad
+                            | InstructionOpcode::CleanupRet
+                            | InstructionOpcode::Resume
+                            | InstructionOpcode::CallBr
+                            | InstructionOpcode::IndirectBr
+                    )
+                })
+            }) {
+                log::info!("(IndirectBranch) skipping {:?}: unsupported EH or indirect terminator", x.get_name());
+                continue;
+            }
+            // Extra legal destinations create CFG edges even though the table
+            // still selects only the original successor. Demote cross-block
+            // values first so these conservative edges cannot invalidate SSA.
+            unsafe { x.fix_stack() };
+            x.clear_stale_analysis_attrs_after_cfg_rewrite();
+            if let VerifyResult::Broken(error) = x.verify_function() {
+                return Err(anyhow::anyhow!("IndirectBranch stack preparation failed: {error}"));
+            }
             functions.push((x, cfg))
         }
 
@@ -115,7 +147,7 @@ impl AmicePass for IndirectBranch {
             let table = module.add_global(xor_key_array_ty, None, ".amice.indirect_branch_key");
             table.set_initializer(&initializer);
             table.set_linkage(Linkage::Private);
-            table.set_constant(true);
+            table.set_constant(false);
 
             module.append_to_compiler_used(table);
 
@@ -125,6 +157,11 @@ impl AmicePass for IndirectBranch {
         };
 
         for (function, _cfg) in &functions {
+            let function_destinations: Vec<_> = non_entry_basic_blocks
+                .iter()
+                .copied()
+                .filter(|block| block.get_parent() == Some(*function))
+                .collect();
             let mut branch_instructions = Vec::new();
             for basic_block in function.get_basic_blocks() {
                 for instruction in basic_block.get_instructions() {
@@ -242,6 +279,10 @@ impl AmicePass for IndirectBranch {
                             .map_err(|e| error!("build load failed: {e}"))
                             .expect("build load failed")
                             .into_int_value();
+                        key_val
+                            .as_instruction_value()
+                            .ok_or_else(|| anyhow::anyhow!("indirect branch key is not a load"))?
+                            .set_volatile(true)?;
 
                         builder
                             .build_xor(enc_index, key_val, "IndirectBranchingKey")
@@ -273,8 +314,17 @@ impl AmicePass for IndirectBranch {
                 else {
                     panic!("build load failed, this should never happen");
                 };
+                // Both local conditional tables and global indexed tables must
+                // remain runtime reads through the optimizer.
+                loaded_address
+                    .as_instruction_value()
+                    .ok_or_else(|| anyhow::anyhow!("indirect branch target is not a load"))?
+                    .set_volatile(true)?;
+                // A singleton destination list lets LLVM replace indirectbr
+                // with br regardless of the volatile target load.
+                let destinations = if is_conditional { &successors } else { &function_destinations };
                 let Ok(mut indir_br) = builder
-                    .build_indirect_branch(loaded_address.as_basic_value_enum(), &successors)
+                    .build_indirect_branch(loaded_address.as_basic_value_enum(), destinations)
                     .map_err(|e| error!("build indirect branch failed: {e}"))
                 else {
                     panic!("build indirect branch failed, this should never happen");
@@ -340,8 +390,8 @@ impl AmicePass for IndirectBranch {
                 br_inst.erase_from_basic_block();
             }
 
-            if function.verify_function_bool() {
-                warn!("function {:?} verify failed", function.get_name());
+            if let VerifyResult::Broken(error) = function.verify_function() {
+                return Err(anyhow::anyhow!("IndirectBranch function verify failed: {error}"));
             }
         }
 
