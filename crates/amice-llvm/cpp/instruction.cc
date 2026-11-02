@@ -3,8 +3,32 @@
 
 #include <llvm/ADT/APInt.h>
 #include <llvm/Config/llvm-config.h>
+#include <llvm/IR/Operator.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 
 extern "C" {
+
+bool amice_instruction_has_poison_generating_flags(llvm::Instruction *I) {
+#if LLVM_VERSION_MAJOR >= 14
+    return I->hasPoisonGeneratingFlags();
+#else
+    if (auto *O = llvm::dyn_cast<llvm::OverflowingBinaryOperator>(I))
+        return O->hasNoUnsignedWrap() || O->hasNoSignedWrap();
+    if (auto *O = llvm::dyn_cast<llvm::PossiblyExactOperator>(I))
+        return O->isExact();
+    return false;
+#endif
+}
+
+bool amice_call_inline(llvm::CallBase *Call) {
+    llvm::InlineFunctionInfo Info;
+    return llvm::InlineFunction(*Call, Info).isSuccess();
+}
+
+llvm::Function *amice_call_resolve_function(llvm::CallBase *Call) {
+    return llvm::dyn_cast<llvm::Function>(
+        Call->getCalledOperand()->stripPointerCastsAndAliases());
+}
 
 llvm::ConstantInt *amice_switch_find_case_dest(llvm::SwitchInst *S, llvm::BasicBlock *B) {
     return S->findCaseDest(B);
@@ -49,6 +73,18 @@ bool amice_gep_accumulate_constant_offset(llvm::Instruction *I, llvm::Module *M,
 
 void amice_phi_replace_incoming_block_with(llvm::PHINode *PHI, llvm::BasicBlock *O, llvm::BasicBlock *N) {
     PHI->replaceIncomingBlockWith(O, N);
+}
+
+void amice_phi_replace_incoming_blocks(
+    llvm::PHINode *PHI,
+    llvm::BasicBlock *O,
+    llvm::BasicBlock *const *N,
+    uint32_t Count) {
+    uint32_t occurrence = 0;
+    for (unsigned Index = 0; Index < PHI->getNumIncomingValues() && occurrence < Count; ++Index) {
+        if (PHI->getIncomingBlock(Index) == O)
+            PHI->setIncomingBlock(Index, N[occurrence++]);
+    }
 }
 
 }

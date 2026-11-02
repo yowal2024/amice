@@ -1,6 +1,27 @@
 # Function Annotations
 
-In-source `annotate` attributes always take precedence over environment variables/config files.
+English | [简体中文](FunctionAnnotations_zh_CN.md)
+
+For passes supporting function annotations, precedence is **function annotation > environment > config file > default**. `AMICE_PASS_ORDER` is an outer pass allowlist: annotations cannot restore an excluded pass.
+
+## Minimal C/C++ Example
+
+```c
+__attribute__((noinline, annotate("+flatten,flatten_mode=basic")))
+int protected_function(int x) {
+    if (x > 10) return x * 3;
+    return x + 7;
+}
+
+__attribute__((noinline, annotate("-flatten")))
+int excluded_function(int x) {
+    return x + 1;
+}
+```
+
+Compile a complete program containing these functions with the plugin as shown in [Quick Start](QuickStart_en_US.md). The first function requests Flatten even without a global switch; the second requests exclusion even when globally enabled. `noinline` helps preserve the demonstration function but does not guarantee that a pass supports it.
+
+String encryption currently uses global configuration and has no working per-function annotation override. For Rust see [Rust Usage](RustUsage_en_US.md); the C attribute syntax above does not apply directly.
 
 ## Configuration Expressions
 
@@ -10,11 +31,11 @@ In-source `annotate` attributes always take precedence over environment variable
 
 ### Key-Value Expressions
 
-`^key=value` passes a key-value pair. You can also write `key=value` or (`+key=value`/`-key=value`), but it's best to follow normal conventions to avoid issues.
+`^key=value` passes a key-value pair. You can also write `key=value` or `+key=value` / `-key=value`; prefer the plain `^key=value` or `key=value` forms.
 
-> Special case: `+flag` = `+flag=yes` = `+flag=1` = `+flag=true`
-> <br/> = `^flag=yes` = `^flag=1` = `^flag=true`
-> <br/> = `flag=yes` = `flag=1` = `flag=true`
+> Special case: `+flag` = `+flag=yes` = `+flag=1` = `+flag=true`,
+> equivalently `^flag=yes` = `^flag=1` = `^flag=true`
+> and `flag=yes` = `flag=1` = `flag=true`.
 
 ## Available Obfuscations
 
@@ -61,30 +82,18 @@ Extracts basic blocks from functions into independent sub-functions.
 
 ### Bogus Control Flow (BCF)
 
-Inserts invalid or equivalent branches between basic blocks.
+Use these annotations to enable BCF, adjust budgets, or override global settings per function. Whole-function cloning and forced inlining can be disabled independently while retaining integer region rewriting. See [Environment Configuration](EnvConfig_en_US.md#bogus-control-flow) for supported cases and limitations.
 
-- Switch
-    - `+bogus_control_flow` (alias: `+bcf`)
-        - Function: Enable bogus control flow
-        - Default: false
+| Annotation | Alias | Default and meaning |
+|---|---|---|
+| `+bogus_control_flow` | `+bcf`, `+boguscfg` | Disabled by default; `-bcf` disables per function |
+| `bogus_control_flow_prob=<n>` | `bcf_prob` | 80; selection percentage for whole-function cloning and candidate regions, capped at 100 |
+| `+bogus_control_flow_clone` | `+bcf_clone` | Enabled by default; `-bcf_clone` disables only the whole-function cloning addition |
+| `bogus_control_flow_max_regions=<n>` | `bcf_max_regions` | 2; regions per function, 0 disables, hard cap 16 |
+| `bogus_control_flow_max_region_instructions=<n>` | `bcf_max_region_instructions` | 8; original instructions per region, below 2 disables, hard cap 16 |
+| `bogus_control_flow_seed=<n>` | `bcf_seed` | Inherits the global seed, random when unconfigured; decimal u64 seed |
 
-- Mode
-    - `bogus_control_flow_mode=<mode>` (alias: `bcf_mode`)
-        - Options:
-            - `basic` (alias: `v1`)
-            - `polaris-primes` (alias: `primes`, `v2`)
-        - Default: `basic`
-        - Note: Different modes use different strategies for generating fake paths
-
-- Parameters
-    - `bogus_control_flow_prob=<0..100>` (alias: `bcf_prob`)
-        - Function: Probability (percentage) of each basic block being obfuscated
-        - Default: 80
-        - Range: 0-100; values above 100 are treated as 100
-    - `bogus_control_flow_loops=<n>` (alias: `bcf_loops`)
-        - Function: Number of times to repeat this obfuscation pass on the same function
-        - Default: 1
-        - Requirement: n >= 1
+Example: `__attribute__((annotate("+bcf bcf_prob=100 bcf_max_regions=1 bcf_max_region_instructions=6 bcf_seed=42")))`.
 
 ### Clone Function (Constant Argument Specialization)
 
@@ -205,7 +214,7 @@ Pre-lowers switch statements to if-else chains, facilitating subsequent obfuscat
 Replaces arithmetic/logical operations with equivalent MBA expressions.
 
 - Switch
-    - `+mba` (alias: `+linearmba`)
+    - `+mba`; optional `-mba_float_regions`, `-mba_pre_expand`, `-mba_opaque_guard`, `mba_max_instructions=32`, `mba_max_added_instructions=512`
         - Function: Enable MBA rewriting
         - Default: false
 
@@ -242,11 +251,33 @@ Splits a single basic block into multiple smaller basic blocks.
         - Default: 3
         - Note: Larger values increase block count and jumps, also increasing size and compile time
 
-### VM Flatten (VMF)
+### VM control-flow flattening (VMF)
 
-Rewrites the target function as a control flow driven by a "virtual machine interpreter + bytecode/instruction table".
+Obfuscates the target function's control flow to increase reverse-engineering difficulty.
 
 - Switch
     - `+vm_flatten` (alias: `+vmf`)
-        - Function: Enable VM-based control flow flattening
+        - Function: Enable VM control-flow flattening
         - Default: false
+
+- `+vm_flatten_distributed` (alias `+vmf_distributed`): enable the distributed transfer prototype; default false. Also requires `+vmf`.
+- `vm_flatten_max_ops=8` (alias `vmf_max_ops`): generate 1..n reversible index operations per transfer, including one S-box substitution, with n clamped to 1..32. Address decoding is separate.
+- `vm_flatten_program_variants=3` (alias `vmf_program_variants`): number of interleaved index programs per transfer, clamped to 1..3; larger values increase size and compile/optimization cost.
+- `vm_flatten_seed=42` (alias `vmf_seed`): distributed-mode seed; random by default, reproducible when specified, including 0.
+
+Example: `annotate("+vmf,+vmf_distributed,vmf_max_ops=8,vmf_program_variants=3,vmf_seed=42")`. VM control-flow flattening runs after BCF. See [environment configuration](EnvConfig_en_US.md#vm-control-flow-flattening) for PHI preservation, optimization and supported functions.
+
+### Instruction-Level VMP (VmVirtualize)
+
+- `+vm_virtualize` (alias `+vmp`): enable VMP for this function; default false.
+- `vm_profile_path=/absolute/path/to/profile` (alias `vm_profile`): select a profile package; defaults to the built-in `amice-simple-vmp`.
+- `vm_runtime_scope=func` or `module`: override the profile's runtime scope.
+
+```c
+__attribute__((noinline, annotate("+vm_virtualize,vm_runtime_scope=func")))
+int sensitive(int x) {
+    return (x * 7) ^ 0x55;
+}
+```
+
+Unsupported functions keep their original implementation. Use `RUST_LOG=amice=debug` to inspect skip reasons. Validate one function before expanding coverage; enabling VMP does not guarantee every function is virtualized. Profile constraints are documented in [VMP Design (Chinese)](VMPDesign_zh_CN.md).

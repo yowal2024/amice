@@ -22,12 +22,12 @@ fn bcf_config() -> ObfuscationConfig {
 }
 
 #[test]
-fn test_bogus_control_flow_basic() {
+fn test_bogus_control_flow_regions() {
     ensure_plugin_built();
 
     let result = CppCompileBuilder::new(
         fixture_path("control_flow", "bogus_control_flow.c", Language::C),
-        "bcf_basic",
+        "bcf_regions",
     )
     .config(bcf_config())
     .compile();
@@ -100,7 +100,7 @@ fn assert_entry_only_conditional_terminator_opt_pass(enable_env: &str) {
             Language::C,
         ));
 
-    let output = cmd.output().expect("failed to execute opt");
+    let output = crate::common::output_with_watchdog(cmd);
     assert!(
         output.status.success(),
         "opt failed\nSTDOUT:\n{}\nSTDERR:\n{}",
@@ -222,7 +222,7 @@ fn test_vm_flatten_clears_stale_analysis_attributes() {
         .arg("-S")
         .arg(fixture_path("control_flow", "stale_analysis_attrs.ll", Language::C));
 
-    let output = cmd.output().expect("failed to execute opt");
+    let output = crate::common::output_with_watchdog(cmd);
     assert!(
         output.status.success(),
         "opt failed\nSTDOUT:\n{}\nSTDERR:\n{}",

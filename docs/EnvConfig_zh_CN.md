@@ -1,8 +1,60 @@
 # 运行时环境变量
 
+[English](EnvConfig_en_US.md) | 简体中文
+
+环境变量由加载插件的编译器进程读取。Bash 使用 `export AMICE_STRING_ENCRYPTION=true` 或单条命令前缀，PowerShell 使用 `$env:AMICE_STRING_ENCRYPTION = 'true'`。
+
+全局优先级为 **环境变量 > 配置文件 > 默认值**；支持函数注解的 Pass 会再应用 [函数注解](FunctionAnnotations_zh_CN.md)。环境布尔值接受 `true/false`、`1/0`、`on/off`（不区分大小写）；不要把注解支持的 `yes` 当作环境变量的 true。
+
+## 全局
+
+| 变量名 | 说明 | 默认值 |
+| --- | --- | --- |
+| `AMICE_PANIC_POLICY` | Pass 内部 panic 时的策略：`skip` —— 告警并跳过该 Pass，模块继续编译（混淆缺失，构建不中断，fail-open）；`abort` —— 立即中止构建（fail-closed，安全敏感构建适用）。panic 的原始信息（位置与 backtrace 提示）始终输出到 stderr 便于报障。 | `skip` |
+
+说明：该策略只影响 Pass 内部的 Rust panic；LLVM 自身的校验失败（如 Broken module）仍会中断构建。
+
+## 支持矩阵
+
+| Pass | 环境变量开关 | C/C++ | Rust | ObjC | 说明 |
+|:---|:---|:---:|:---:|:---:|:---|
+| String Encryption | `AMICE_STRING_ENCRYPTION` | ✅ | ✅ | ⏳ | 字符串加密，支持 `xor` / `simd_xor`、lazy/global 解密、栈/堆解密配置，覆盖宽字符（UTF-16/UTF-32/wchar_t）字面量 |
+| Indirect Call | `AMICE_INDIRECT_CALL` | ✅ | ✅ | ❌ | 将直接调用改写为函数表/索引形式的间接调用 |
+| Indirect Branch | `AMICE_INDIRECT_BRANCH` | ✅ | ✅ | ❌ | 将分支改写为 `indirectbr`，支持 dummy block、表重排、索引加密等 flags |
+| Split Basic Block | `AMICE_SPLIT_BASIC_BLOCK` | ✅ | ✅ | ❌ | 按配置切割基本块 |
+| Lower Switch | `AMICE_LOWER_SWITCH` | ✅ | ✅ | ❌ | 降级 LLVM `switch` 指令 |
+| VM Flatten | `AMICE_VM_FLATTEN` | ✅ | ✅ | ❌ | VM控制流平坦化 |
+| VM Virtualize | `AMICE_VM_VIRTUALIZE` | ✅ | ✅ | ❌ | 指令级 VMP 虚拟化，支持全局开启或通过函数注解按函数启用 |
+| Flatten | `AMICE_FLATTEN` | ✅ | ✅ | ❌ | 控制流平坦化，支持 `basic` / `dominator` 模式 |
+| MBA | `AMICE_MBA` | ✅ | ✅ | ❌ | 混合布尔算术表达式重写 |
+| Bogus Control Flow | `AMICE_BOGUS_CONTROL_FLOW` | ✅ | ✅ | ❌ | 混淆程序控制流，增加逆向分析难度 |
+| Function Wrapper | `AMICE_FUNCTION_WRAPPER` | ✅ | ✅ | ❌ | 生成包装函数并替换调用点 |
+| Clone Function | `AMICE_CLONE_FUNCTION` | ✅ | ✅ | ❌ | 常量参数特化克隆 |
+| Alias Access | `AMICE_ALIAS_ACCESS` | ✅ | ✅ | ❌ | 基于指针链的别名访问混淆 |
+| Custom Calling Conv | `AMICE_CUSTOM_CALLING_CONV` | ⏳ | ⏳ | ❌ | 预留实现，目前不执行调用约定变换 |
+| Delay Offset Loading | `AMICE_DELAY_OFFSET_LOADING` | ✅ | ⏳ | ❌ | GEP 偏移延迟加载/可选 XOR 保护 |
+| Param Aggregate | `AMICE_PARAM_AGGREGATE` | ✅ | ⏳ | ❌ | 参数结构化聚合混淆 |
+| Basic Block Outlining | `AMICE_BASIC_BLOCK_OUTLINING` | ✅ | ⏳ | ❌ | 将基础块提取为独立子函数，亦称 BB2Func |
+| Shuffle Blocks | `AMICE_SHUFFLE_BLOCKS` | ✅ | ⏳ | ❌ | 基本块重排 |
+
+> 图例：✅ 已支持；⏳ 进行中 / 计划中 / 未测试；❌ 暂未规划。
+
+各 Pass 的完整参数见下文分节；按函数启用/禁用见 [函数注解](FunctionAnnotations_zh_CN.md)。
+
+## 配置文件、顺序和日志
+
+| 变量 | 用法 | 默认 |
+| --- | --- | --- |
+| `AMICE_CONFIG_PATH` | TOML/YAML/JSON 文件路径，推荐绝对路径；完整示例见 [Pass 运行顺序](PassOrder_zh_CN.md) | 不读取文件 |
+| `AMICE_PASS_ORDER` | 逗号或分号分隔的 Pass 名称；只安装列表中的 Pass，不会自动开启它们 | 按优先级排序 |
+| `AMICE_PASS_PRIORITY_OVERRIDE` | 例如 `IndirectCall=1100,StringEncryption=1000`；有显式顺序时不生效 | 不覆盖 |
+| `RUST_LOG` | `amice=info` 查看加载/执行日志；`amice=debug` 查看更细的诊断 | 未显式配置 |
+
+配置读取失败目前会回退默认值；设置了路径不代表文件已成功应用。用下面的开关验证目标产物，排查步骤见 [故障排除](Troubleshooting_zh_CN.md)。
+
 ## 字符串加密
 
-源代码：`src/aotu/string_encryption`
+源代码：`crates/amice/src/aotu/string_encryption`
 
 | 变量名                                      | 说明                                                                                                                             | 默认值   |
 |------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|-------|
@@ -16,21 +68,28 @@
 
 > **Rust 注意**
 > ```bash
-> export AMICE_STRING_ONLY_LLVM_STRING=false  # Rust 字符串全局变量名为 alloc_xxx，而非 .str
+> export AMICE_STRING_ONLY_DOT_STRING=false  # Rust 字符串全局变量名为 alloc_xxx，而非 .str
 > ```
+
+> `AMICE_STRING_ONLY_LLVM_STRING` 是 `AMICE_STRING_ONLY_DOT_STRING` 的兼容旧名；两者都设置时以后者为准。
+
+> **宽字符（UTF-16/UTF-32/wchar_t）判定说明**
+> - 宽字符串的判定与 `LLVMIsConstantString` 对 i8 的规则一致：全部元素为常量整数且末元素为 0；i16/i32 以外的宽度（如 `[N x i64]`）一律跳过。
+> - MSVC 命名目标（Windows）的宽字面量全局名形如 `??_C@...`，不含 `.str`，默认 `only_dot_str=true` 时不会命中，需要 `AMICE_STRING_ONLY_DOT_STRING=false`。
+> - `zeroinitializer`（如 `u""`）会因空值检查被跳过，而显式的 `[i16 0, i16 0, ...]` 会被加密——两种写法行为不一致，i8 路径同样如此。
 
 ## 间接调用混淆
 
-源代码：`src/aotu/indirect_call`
+源代码：`crates/amice/src/aotu/indirect_call`
 
 | 变量名                         | 说明                                                 | 默认值   |
 |-----------------------------|----------------------------------------------------|-------|
-| AMICE_INDIRECT_CALL         | 是否启用间接跳转：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
+| AMICE_INDIRECT_CALL         | 是否启用间接调用：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
 | AMICE_INDIRECT_CALL_XOR_KEY | 间接跳转下标xor密钥<br/>备注：输入`0`关闭间接跳转下标加密                 | 随机数   |
 
 ## 间接跳转混淆
 
-源代码：`src/aotu/indirect_branch`
+源代码：`crates/amice/src/aotu/indirect_branch`
 
 | 变量名                         | 说明                                                               | 默认值                |
 |-----------------------------|------------------------------------------------------------------|--------------------|
@@ -48,33 +107,55 @@
 
 ## 切割基本块
 
-源代码：`src/aotu/split_basic_block`
+源代码：`crates/amice/src/aotu/split_basic_block`
 
 | 变量名                          | 说明                                                  | 默认值   |
 |------------------------------|-----------------------------------------------------|-------|
 | AMICE_SPLIT_BASIC_BLOCK      | 是否启用切割基本块：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
-| AMICE_SPLIT_BASIC_BLOCk_NUMS | 切割基本块次数                                             | 3     |
+| AMICE_SPLIT_BASIC_BLOCK_NUM | 切割基本块次数                                             | 3     |
 
 ## `switch`降级
 
-源代码：`src/aotu/lower_switch`
+源代码：`crates/amice/src/aotu/lower_switch`
 
 | 变量名                                    | 说明                                             | 默认值   |
 |----------------------------------------|------------------------------------------------|-------|
 | AMICE_LOWER_SWITCH                     | 是否开启：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
 | ~~AMICE_LOWER_SWITCH_WITH_DUMMY_CODE~~ | 是否开启降级后插入无效代码（开启可能无法通过模块校验导致`-O1`等编译失败）        | false |
 
-## 扁平化控制流 (VM)
+## VM控制流平坦化
 
-源代码：`src/aotu/vm_flatten`
+源代码：`crates/amice/src/aotu/vm_flatten`
 
 | 变量名              | 说明                                             | 默认值   |
 |------------------|------------------------------------------------|-------|
 | AMICE_VM_FLATTEN | 是否开启：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
+| AMICE_VM_FLATTEN_DISTRIBUTED | 启用分散跳转原型；需要同时开启 `AMICE_VM_FLATTEN` | false |
+| AMICE_VM_FLATTEN_MAX_OPS | 分散模式每个跳转点生成 1～n 个可逆索引操作，其中必含一次 S-box 替换；n 限制在 1～32。单个操作可展开为多条 IR 指令，地址解码另计 | 8 |
+| AMICE_VM_FLATTEN_PROGRAM_VARIANTS | 每个跳转点交错生成的可逆索引程序数量；限制在 1～3。数量越大，体积和编译/优化开销越高 | 3 |
+| AMICE_VM_FLATTEN_SEED | 分散模式的 u64 十进制种子；显式指定（包括 0）时可复现 | 随机数 |
+
+VM控制流平坦化在优化末尾执行，顺序固定为虚假控制流（`BogusControlFlow`）之后的 `VmFlatten`，完整 LTO 末尾也采用此顺序。显式 Pass 顺序或优先级与此依赖冲突时会调整并输出警告；不会自动开启未启用的 Pass。
+
+分散模式在各跳转点生成索引计算、地址表加载和 `indirectbr`，通过网关块和 PHI 修复保持原程序语义，不生成集中字节码解释器。默认模式使用解释器，`random_none_node_opcode` 只作用于解释器模式。配置文件字段为 `vm_flatten.distributed`、`vm_flatten.max_ops`、`vm_flatten.program_variants` 和 `vm_flatten.seed`。
+
+每个跳转点生成 1～3 个等长的可逆索引程序，并按操作位置交错生成候选计算；`program_variants` 控制数量。程序选择值由调用状态和操作序号共同推进的 schedule 逐步产生，逆向编码和正向解码使用同一条 schedule。每个程序包含一次无表替换，替换网络组合加减、异或、奇数乘法及移位/旋转，由调用状态派生的运行时键参与计算。
+
+私有初始化函数物化目标地址，跳转点使用本次调用独立的稀疏整数表和状态相关解码。目标地址仍可从初始化和执行过程分析。索引程序使用整数计算和 LLVM `select` 选择候选；完整网关路径仍有条件分支，最终机器码是否包含分支取决于后端。运行时键和栈地址派生掩码不是保密密钥。
+
+```powershell
+$env:AMICE_VM_FLATTEN = "true"
+$env:AMICE_VM_FLATTEN_DISTRIBUTED = "true"
+$env:AMICE_VM_FLATTEN_MAX_OPS = "8"
+$env:AMICE_VM_FLATTEN_PROGRAM_VARIANTS = "3"
+$env:AMICE_VM_FLATTEN_SEED = "42"
+```
+
+分散模式仍暴露 IR 后继集合；单后继间接跳转可能被优化为直接跳转。volatile 访问用于阻止常量折叠，不保证防提取、阻止 switch 识别或不可还原，初始化和运行时解码过程仍可观察。异常处理、已有基本块地址引用、其他间接跳转、`naked` 及 `ExactMatch` / `SameSize` COMDAT 函数保持原样。地址编码要求代码、全局及栈使用默认地址空间的 32/64 位整数型指针；不支持的布局会输出警告并跳过。建议先对少量函数检查最终产物和性能。
 
 ## 指令级 VMP 虚拟化
 
-源代码：`src/aotu/vm_virtualize`
+源代码：`crates/amice/src/aotu/vm_virtualize`
 
 | 变量名                    | 说明                                                                                                         | 默认值                       |
 |------------------------|------------------------------------------------------------------------------------------------------------|---------------------------|
@@ -87,7 +168,7 @@
 
 ## 控制流平坦化
 
-源代码：`src/aotu/flatten`
+源代码：`crates/amice/src/aotu/flatten`
 
 | 变量名                         | 说明                                                       | 默认值     |
 |-----------------------------|----------------------------------------------------------|---------|
@@ -97,44 +178,60 @@
 | AMICE_FLATTEN_LOWER_SWITCH  | 是否自动降级switch                                             | true    |
 | AMICE_FLATTEN_LOOP_COUNT    | 循环次数（最好小于等于7）                                            | 1       |
 | AMICE_FLATTEN_ALWAYS_INLINE | 是否把`dominator`模式的更新`key_array`的函数给inline了                | false   |
+| `AMICE_FLATTEN_SKIP_BIG_FUNCTION` | 跳过过大的函数 | false |
 
 ## MBA算术混淆
 
-源代码：`src/aotu/mba`
+源代码：`crates/amice/src/aotu/mba`
 
 | 变量名                                  | 说明                                             | 默认值   |
 |--------------------------------------|------------------------------------------------|-------|
 | AMICE_MBA                            | 是否开启：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
-| AMICE_MBA_AUX_COUNT                  | 算术混淆辅助变量个数                                     | `2`   |
-| AMICE_MBA_REWRITE_OPS                |                                                | `24`  |
-| AMICE_MBA_REWRITE_DEPTH              |                                                | `3`   |
-| AMICE_MBA_ALLOC_AUX_PARAMS_IN_GLOBAL | 是否将辅助变量分配到全局变量                                 | false |
-| AMICE_MBA_FIX_STACK                  | 混淆后执行`fixStack`                                | false |
+| AMICE_MBA_FLOAT_REGIONS              | 在受支持的硬件浮点目标上启用精确 binary64 SSA 区域             | true  |
+| AMICE_MBA_PRE_EXPAND                 | 将整数等价 DAG 直接展开到浮点区域内                          | true  |
+| AMICE_MBA_OPAQUE_GUARD               | 每次调用 volatile 读取私有全局种子，生成有界浮点载体           | true  |
+| AMICE_MBA_MAX_INSTRUCTIONS           | 每函数最多改写的原始指令数，上限 512；0 表示跳过                | `128` |
+| AMICE_MBA_MAX_ADDED_INSTRUCTIONS     | 每函数生成指令数的保守预算                                  | `2048` |
+
+MBA 现在沿算术、位运算、select 和 phi 改变 SSA 值的表示。旧的辅助变量、重写深度、
+fixStack 和 optnone 配置已移除。支持范围、语义约束和测试方法见 [MBA 区域设计](MbaRegions.md)。
 
 ## 虚假控制流混淆
 
-源代码：`src/aotu/bogus_control_flow`
+源代码：`crates/amice/src/aotu/bogus_control_flow`。
 
-| 变量名                            | 说明                                                                                                                                                                                                             | 默认值     |
-|--------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
-| AMICE_BOGUS_CONTROL_FLOW       | 是否开启：<br/>• `true` —— 启用；<br/>• `false` —— 关闭;                                                                                                                                                                 | false   |
-| AMICE_BOGUS_CONTROL_FLOW_MODE  | 混淆模式：<br/>• `basic` —— 默认的，基础版，甚至可能被优化；<br/>• `polaris-primes` —— 从[Polaris-Obfuscator](https://github.com/za233/Polaris-Obfuscator/blob/main/src/llvm/lib/Transforms/Obfuscation/BogusControlFlow.cpp)抄的一个变种； | `basic` | 
-| AMICE_BOGUS_CONTROL_FLOW_PROB  | 混淆概率                                                                                                                                                                                                           | `80`    |
-| AMICE_BOGUS_CONTROL_FLOW_LOOPS | 循环执行次数                                                                                                                                                                                                         | `1`     |
+BCF 混淆程序控制流，增加逆向分析难度，在 OptimizerLast / FullLtoLast 执行。默认启用完整原始函数的克隆与强制内联补充；可单独关闭此补充，继续使用整数区域变换。整数区域支持 i8/i16/i32/i64 的 add/sub/and/or/xor，跳过已有循环中的区域和异常处理函数。
+
+| 变量名 | 说明 | 默认值 |
+|---|---|---|
+| AMICE_BOGUS_CONTROL_FLOW | 启用 BCF | `false` |
+| AMICE_BOGUS_CONTROL_FLOW_PROB | 整函数克隆及候选区域的选择概率，0–100，超过 100 按 100 处理 | `80` |
+| AMICE_BOGUS_CONTROL_FLOW_CLONE | 启用完整原始函数克隆与强制内联；关闭后保留整数区域变换 | `true` |
+| AMICE_BOGUS_CONTROL_FLOW_MAX_REGIONS | 每函数最多转换的区域数；0 禁用，硬上限 16 | `2` |
+| AMICE_BOGUS_CONTROL_FLOW_MAX_REGION_INSTRUCTIONS | 每区域原始指令上限；小于 2 不转换，超过 16 按 16 处理 | `8` |
+| AMICE_BOGUS_CONTROL_FLOW_SEED | u64 十进制种子；未指定时随机生成，显式指定时可复现 | 随机数 |
+
+区域预算不限制整函数克隆的大小；`MAX_REGIONS=0` 或 `MAX_REGION_INSTRUCTIONS<2` 会禁用 BCF。变参、直接递归、异常处理、基本块地址逃逸及其他不满足内联条件的函数跳过克隆补充；内联失败时仍按整数区域规则处理。指针参数保持透传。整数参数仅在不破坏运算前提时扰动。后续优化可能合并等价分支，需检查最终产物中的保留情况。
+
+配置文件中的补充开关为 `bogus_control_flow.clone`。启用 BCF 会增加运行时间和代码体积，完整克隆的成本随函数大小增长，建议从少量目标函数开始。不要用于要求恒定执行时间的代码。逐函数配置见 [函数注解](FunctionAnnotations_zh_CN.md)。
+
+含 `llvm.localescape`、`llvm.gcroot` 或入口收敛令牌的函数保持原样，以保留 LLVM 对入口位置的要求。函数签名含当前绑定不支持的类型（如 Target Extension 类型），或调用具有 `noduplicate`、`convergent`、`returns_twice` 限制的函数（包括别名调用）时，跳过克隆补充；满足条件的整数区域仍可处理。含内联汇编的函数也跳过克隆补充，避免复制汇编标签和状态。
+
+`ExactMatch` / `SameSize` COMDAT 中的函数保持原样，避免不同编译单元的随机变换破坏链接器对副本内容或大小一致的要求。
 
 ## 函数包装
 
-源代码：`src/aotu/function_wrapper`
+源代码：`crates/amice/src/aotu/function_wrapper`
 
 | 变量名                                | 说明                                             | 默认值   |
 |------------------------------------|------------------------------------------------|-------|
 | AMICE_FUNCTION_WRAPPER             | 是否开启：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
-| AMICE_FUNCTION_WRAPPER_PROBABILITY | 混淆概率                                           | `80`  |
-| AMICE_FUNCTION_WRAPPER_TIMES       | 循环执行次数                                         | `1`   |
+| AMICE_FUNCTION_WRAPPER_PROBABILITY | 混淆概率                                           | `70`  |
+| AMICE_FUNCTION_WRAPPER_TIMES       | 循环执行次数                                         | `3`   |
 
 ## 常参特化克隆混淆
 
-源代码：`src/aotu/clone_function`
+源代码：`crates/amice/src/aotu/clone_function`
 
 | 变量名                  | 说明                                             | 默认值   |
 |----------------------|------------------------------------------------|-------|
@@ -142,7 +239,7 @@
 
 ## 别名访问混淆
 
-源代码：`src/aotu/alias_access`
+源代码：`crates/amice/src/aotu/alias_access`
 
 | 变量名                                | 说明                                                         | 默认值             |
 |------------------------------------|------------------------------------------------------------|-----------------|
@@ -153,26 +250,17 @@
 
 ## 自定义调用约定
 
-源代码：`src/aotu/custom_calling_conv`
+源代码：`crates/amice/src/aotu/custom_calling_conv`
 
 | 变量名                       | 说明                                             | 默认值  |
 |---------------------------|------------------------------------------------|------|
 | AMICE_CUSTOM_CALLING_CONV | 是否开启：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | true |
 
-> 默认情况下开启，但是不会修改任何函数的调用约定，
-> ```cpp
-> #define OBFUSCATE_CC __attribute__((annotate("+custom_calling_conv")))
-> 
-> OBFUSCATE_CC
-> int add(int a, int b) {
->      return a + b;
-> }
-> ```
-> 只有当函数标记了`custom_calling_conv`注解的时候，才会对这个函数执行该混淆！
+> 配置默认值为 true，但当前调用约定实现仍是占位代码；即使添加注解也不会产生调用约定变换。
 
 ## GEP偏移量混淆（延迟偏移加载）
 
-源代码：`src/aotu/delay_offset_loading`
+源代码：`crates/amice/src/aotu/delay_offset_loading`
 
 | 变量名                                   | 说明                                             | 默认值   |
 |---------------------------------------|------------------------------------------------|-------|
@@ -181,8 +269,28 @@
 
 ## 参数结构化混淆（PAO）
 
-源代码：`src/aotu/param_aggregate`
+源代码：`crates/amice/src/aotu/param_aggregate`
 
 | 变量名                   | 说明                                             | 默认值   |
 |-----------------------|------------------------------------------------|-------|
 | AMICE_PARAM_AGGREGATE | 是否开启：<br/>• `true` —— 启用；<br/>• `false` —— 关闭; | false |
+
+## 函数分片（Basic Block Outlining）
+
+源代码：`crates/amice/src/aotu/basic_block_outlining`
+
+| 变量名 | 说明 | 默认值 |
+| --- | --- | --- |
+| `AMICE_BASIC_BLOCK_OUTLINING` | 开启基本块外提 | false |
+| `AMICE_BASIC_BLOCK_OUTLINING_MAX_EXTRACTOR_SIZE` | 提取器规模参数，必须是非负整数；非法值会导致配置解析失败 | 16 |
+
+含 `llvm.stacksave` / `llvm.stackrestore` 调用（如 VLA 清理）的基本块不参与外提：这类块绑定所在函数的动态栈帧，外提后会在错误栈帧上恢复栈指针并破坏返回路径（见 issue #101）。同一函数内的其余块仍正常外提。
+
+## 基本块重排（Shuffle Blocks）
+
+源代码：`crates/amice/src/aotu/shuffle_blocks`
+
+| 变量名 | 说明 | 默认值 |
+| --- | --- | --- |
+| `AMICE_SHUFFLE_BLOCKS` | 开启基本块重排 | false |
+| `AMICE_SHUFFLE_BLOCKS_FLAGS` | 逗号分隔的 `random`、`reverse`、`rotate`；至少选一个才能产生重排，环境 flags 与文件 flags 合并 | 空 |

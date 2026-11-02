@@ -131,7 +131,7 @@ impl RustCompileBuilder {
         }
 
         cmd.current_dir(&self.project_dir);
-        cmd.output().expect("Failed to execute cargo rustc")
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn add_cargo_toolchain(&self, cmd: &mut Command) {
@@ -145,6 +145,12 @@ impl RustCompileBuilder {
     fn needs_opt_fallback(&self, config: &LlvmConfig) -> bool {
         if !(self.use_plugin && self.use_nightly) {
             return false;
+        }
+        // Force switch to the out-of-process opt path. Needed when rustc's
+        // static LLVM and the dynamically linked plugin would coexist in one
+        // process and abort on duplicate CommandLine option registration.
+        if std::env::var("AMICE_FORCE_OPT_FALLBACK").is_ok_and(|v| !v.is_empty()) {
+            return true;
         }
         let toolchain = rust_toolchain_override();
         rustc_llvm_major(toolchain.as_deref())
@@ -195,7 +201,7 @@ impl RustCompileBuilder {
         self.config.apply_to_command(&mut cmd);
         cmd.arg("--").arg("--emit=llvm-ir");
         cmd.current_dir(&self.project_dir);
-        cmd.output().expect("Failed to emit Rust LLVM IR")
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn locate_emitted_ir(&self, target_dir: &Path) -> PathBuf {
@@ -234,21 +240,20 @@ impl RustCompileBuilder {
             .arg("-o")
             .arg(optimized_ir);
         self.config.apply_to_command(&mut cmd);
-        cmd.output().expect("Failed to execute opt")
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn run_llc(&self, config: &LlvmConfig, optimized_ir: &Path, object: &Path) -> Output {
         let llc = Path::new(&config.prefix).join("bin").join("llc");
-        Command::new(llc)
-            .env("CCACHE_DISABLE", "1")
+        let mut cmd = Command::new(llc);
+        cmd.env("CCACHE_DISABLE", "1")
             .env(&config.env_var, &config.prefix)
             .arg("-relocation-model=pic")
             .arg("-filetype=obj")
             .arg(optimized_ir)
             .arg("-o")
-            .arg(object)
-            .output()
-            .expect("Failed to execute llc")
+            .arg(object);
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn link_pic_object(&self, config: &LlvmConfig, object: &Path, binary_path: &Path) -> Output {
@@ -269,10 +274,18 @@ impl RustCompileBuilder {
             .arg("amice_rust_link")
             .arg(&stub)
             .arg("-C")
-            .arg(format!("link-arg={}", object.display()))
-            .arg("-o")
-            .arg(binary_path);
-        cmd.output().expect("Failed to link Rust object")
+            .arg(format!("link-arg={}", object.display()));
+        // The object is appended after rustc's rlibs and default libraries, so
+        // libcalls it makes cannot be resolved by them. LLVM 21+ AArch64
+        // codegen lowers atomics to outline-atomics helpers (`__aarch64_cas*`)
+        // that only libgcc_s provides; rustc's own earlier `-lgcc_s` is already
+        // dropped by `--as-needed` at that point, so link the provider again
+        // after the object. LLVM <= 20 inlines the atomics and never needs it.
+        if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+            cmd.arg("-C").arg("link-arg=-lgcc_s");
+        }
+        cmd.arg("-o").arg(binary_path);
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn opt_pipeline_level(profile: &str) -> &'static str {

@@ -129,13 +129,18 @@ impl CppCompileBuilder {
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
+        if self.requests_llvm_ir_output() {
+            // IR assertions inspect generated value and block names. Clang
+            // release builds otherwise discard them by default.
+            cmd.arg("-fno-discard-value-names");
+        }
 
         // Add source and output
         cmd.arg(&self.source);
         cmd.arg("-o");
         cmd.arg(&self.output);
 
-        let output = cmd.output().expect("Failed to execute compiler");
+        let output = crate::common::output_with_watchdog(cmd);
 
         CompileResult {
             output,
@@ -195,12 +200,13 @@ impl CppCompileBuilder {
         }
         cmd.arg("-Xclang")
             .arg("-disable-lifetime-markers")
+            .arg("-fno-discard-value-names")
             .arg("-S")
             .arg("-emit-llvm")
             .arg(&self.source)
             .arg("-o")
             .arg(input_ir);
-        cmd.output().expect("Failed to execute compiler")
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn run_opt(&self, config: &super::LlvmConfig, input_ir: &Path, optimized_ir: &Path) -> Output {
@@ -215,7 +221,7 @@ impl CppCompileBuilder {
             .arg("-o")
             .arg(optimized_ir);
         self.config.apply_to_command(&mut cmd);
-        cmd.output().expect("Failed to execute opt")
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn link_optimized_ir(&self, optimized_ir: &Path) -> Output {
@@ -225,7 +231,7 @@ impl CppCompileBuilder {
             cmd.arg(arg);
         }
         cmd.arg(optimized_ir).arg("-o").arg(&self.output);
-        cmd.output().expect("Failed to execute compiler")
+        crate::common::output_with_watchdog(cmd)
     }
 
     fn requests_llvm_ir_output(&self) -> bool {

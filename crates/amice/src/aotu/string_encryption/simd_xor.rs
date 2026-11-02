@@ -59,7 +59,7 @@ fn do_handle<'a>(cfg: &StringEncryptionConfig, module: &mut Module<'a>, key: &[u
             flag.set_linkage(Linkage::Private);
             flag
         });
-        global.set_initializer(&ctx.const_string(&encoded, false));
+        global.set_initializer(&super::rebuild_const_string(ctx, candidate.elem_size, &encoded));
         global.set_constant(false);
         let string = EncryptedGlobalValue::new_array_string(global, encoded.len() as u32, flag, false, candidate.users);
         strings.push(string);

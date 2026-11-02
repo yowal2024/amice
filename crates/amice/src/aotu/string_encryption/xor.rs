@@ -44,7 +44,7 @@ fn do_handle<'a>(cfg: &StringEncryptionConfig, module: &mut Module<'a>) -> anyho
             flag.set_linkage(Linkage::Private);
             flag
         });
-        global.set_initializer(&ctx.const_string(&encoded, false));
+        global.set_initializer(&super::rebuild_const_string(ctx, candidate.elem_size, &encoded));
         global.set_constant(false);
         let mut string =
             EncryptedGlobalValue::new_array_string(global, encoded.len() as u32, flag, false, candidate.users);
@@ -352,11 +352,16 @@ fn add_decrypt_function<'a>(
     // 从源地址读取
     let src_gep = builder.build_gep2(i8_ty, ptr, &[index], "src_gep")?;
     let ch = builder.build_load2(i8_ty, src_gep, "cur")?.into_int_value();
+    if let Some(load_inst) = ch.as_instruction_value() {
+        // Keep GlobalOpt from evaluating the decryptor back into plaintext.
+        load_inst.set_volatile(true)?;
+    }
     // 解密
     let xored = builder.build_xor(ch, xor_mask, "new")?;
     // 写入目标地址（栈上）
     let dst_gep = builder.build_gep2(i8_ty, dst_ptr, &[index], "dst_gep")?;
-    builder.build_store(dst_gep, xored)?;
+    let store_inst = builder.build_store(dst_gep, xored)?;
+    store_inst.set_volatile(true)?;
 
     let next_index = builder.build_int_add(index, ctx.i32_type().const_int(1, false), "")?;
     builder.build_store(idx, next_index)?;

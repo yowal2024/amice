@@ -10,13 +10,16 @@ use amice_macro::amice;
 use amice_plugin::inkwell::llvm_sys::prelude::LLVMValueRef;
 use amice_plugin::inkwell::module::Module;
 use amice_plugin::inkwell::values::{
-    AnyValueEnum, ArrayValue, AsValueRef, BasicValue, BasicValueEnum, GlobalValue, InstructionOpcode, InstructionValue,
-    PointerValue, StructValue,
+    ArrayValue, AsValueRef, BasicValue, BasicValueEnum, BasicValueUse, GlobalValue, InstructionOpcode,
+    InstructionValue, PointerValue, StructValue,
 };
 use amice_plugin::{LlvmModulePass, ModuleAnalysisManager, PreservedAnalyses, inkwell};
+use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
-    LLVMGetAsString, LLVMGetFirstUse, LLVMGetNextUse, LLVMGetUser, LLVMIsAConstantArray, LLVMIsAConstantExpr,
-    LLVMIsAConstantStruct, LLVMIsAGlobalVariable, LLVMIsAInstruction, LLVMIsGlobalConstant, LLVMIsThreadLocal,
+    LLVMConstIntGetZExtValue, LLVMGetAggregateElement, LLVMGetAsString, LLVMGetFirstUse, LLVMGetIntTypeWidth,
+    LLVMGetNextUse, LLVMGetTypeKind, LLVMGetUser, LLVMIsAConstantArray, LLVMIsAConstantExpr, LLVMIsAConstantInt,
+    LLVMIsAConstantStruct, LLVMIsAGlobalVariable, LLVMIsAInstruction, LLVMIsGlobalConstant, LLVMIsPoison,
+    LLVMIsThreadLocal, LLVMIsUndef, LLVMTypeOf,
 };
 use std::ptr::NonNull;
 
@@ -211,9 +214,125 @@ pub(crate) fn array_as_const_string<'a>(arr: &'a ArrayValue) -> Option<&'a [u8]>
     }
 }
 
+/// inkwell 的 `AnyValueEnum` 不支持 token/label/metadata 类型的值（如 MSVC 按
+/// 类型 catch 时的 `catchpad`/`catchswitch`），`get_user()` 在这类值上会直接
+/// panic（issue #99）。遍历使用者前先按类型类别确认，不支持的返回 false，
+/// 让调用方跳过这些候选，保留 fork 禁止隐式全局构造回退的约束。
+pub(crate) fn use_user_supported(u: &BasicValueUse) -> bool {
+    unsafe {
+        let user = LLVMGetUser(u.as_mut_ptr());
+        if user.is_null() {
+            return false;
+        }
+        !matches!(
+            LLVMGetTypeKind(LLVMTypeOf(user)),
+            LLVMTypeKind::LLVMTokenTypeKind | LLVMTypeKind::LLVMLabelTypeKind | LLVMTypeKind::LLVMMetadataTypeKind
+        )
+    }
+}
+
+/// 该全局的任意使用者落在 inkwell 无法表达的值类别上（token/label/metadata，
+/// 如 MSVC `catchpad` 使用 RTTI typeinfo，issue #99）。这类全局应整体跳过
+/// 加密：typeinfo 并非机密字符串，且逐使用点插入会在使用收集阶段崩溃。
+pub(crate) fn global_has_unsupported_user(global: &GlobalValue) -> bool {
+    let mut use_opt = global.get_first_use();
+    while let Some(u) = use_opt {
+        use_opt = u.get_next_use();
+        if !use_user_supported(&u) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns the element size in bytes when `arr` is a wide-character string:
+/// [N x i16] (char16_t, wchar_t on Windows) or [N x i32] (char32_t, wchar_t on
+/// Linux/macOS). Mirroring LLVMIsConstantString for [N x i8], every element
+/// must be a constant integer and the last one must be null.
+pub(crate) fn wide_string_elem_size(arr: &ArrayValue) -> Option<u32> {
+    let len = arr.get_type().len();
+    if len < 2 {
+        return None;
+    }
+
+    let mut elem_size: Option<u32> = None;
+    let mut last_value: u64 = 1;
+    for i in 0..len {
+        let elem = unsafe { LLVMGetAggregateElement(arr.as_value_ref(), i) };
+        if elem.is_null()
+            || unsafe { LLVMIsAConstantInt(elem) }.is_null()
+            || unsafe { LLVMIsUndef(elem) != 0 || LLVMIsPoison(elem) != 0 }
+        {
+            return None;
+        }
+        if i == 0 {
+            elem_size = match unsafe { LLVMGetIntTypeWidth(LLVMTypeOf(elem)) } {
+                16 => Some(2),
+                32 => Some(4),
+                _ => return None,
+            };
+        }
+        last_value = unsafe { LLVMConstIntGetZExtValue(elem) };
+    }
+
+    if last_value == 0 { elem_size } else { None }
+}
+
+/// Raw bytes of a constant string array regardless of the element width
+/// ([N x i8], [N x i16] or [N x i32]); wide elements are stored little-endian.
+/// Returns the byte string and the element size in bytes, or None when the
+/// array is not a constant null-terminated string.
+pub(crate) fn array_as_const_string_bytes(arr: &ArrayValue) -> Option<(Vec<u8>, u32)> {
+    // LLVMGetAsString hands out raw bytes for integer arrays of any width, so
+    // it must stay gated behind LLVMIsConstantString; otherwise wide arrays
+    // would be mistaken for [N x i8] strings.
+    if arr.is_const_string() {
+        return array_as_const_string(arr).map(|bytes| (bytes.to_vec(), 1));
+    }
+
+    let elem_size = wide_string_elem_size(arr)?;
+    let len = arr.get_type().len() as usize;
+    let mut bytes = Vec::with_capacity(len * elem_size as usize);
+    for i in 0..len {
+        let elem = unsafe { LLVMGetAggregateElement(arr.as_value_ref(), i as _) };
+        if elem.is_null() {
+            return None;
+        }
+        bytes.extend_from_slice(&unsafe { LLVMConstIntGetZExtValue(elem) }.to_le_bytes()[..elem_size as usize]);
+    }
+    Some((bytes, elem_size))
+}
+
+/// Rebuilds the encrypted initializer while keeping the original array type.
+/// Wide strings cannot go through `Context::const_string` because it always
+/// produces an [N x i8] array; their bytes are re-grouped per element instead.
+pub(crate) fn rebuild_const_string<'a>(
+    ctx: inkwell::context::ContextRef<'a>,
+    elem_size: u32,
+    bytes: &[u8],
+) -> ArrayValue<'a> {
+    if elem_size == 1 {
+        return ctx.const_string(bytes, false);
+    }
+
+    let elem_ty = ctx
+        .custom_width_int_type((elem_size * 8).try_into().expect("wide string element width"))
+        .expect("wide string element type");
+    let values: Vec<_> = bytes
+        .chunks_exact(elem_size as usize)
+        .map(|chunk| {
+            let mut buf = [0u8; 8];
+            buf[..elem_size as usize].copy_from_slice(chunk);
+            elem_ty.const_int(u64::from_le_bytes(buf), false)
+        })
+        .collect();
+    elem_ty.const_array(&values)
+}
+
 struct StringCandidate<'a> {
     global: GlobalValue<'a>,
     bytes: Vec<u8>,
+    elem_size: u32,
     users: Vec<(LLVMValueRef, u32)>,
 }
 
@@ -320,25 +439,29 @@ fn collect_string_candidates<'a>(module: &Module<'a>, cfg: &StringEncryptionConf
                 continue;
             }
         }
-        if cfg.only_dot_str && !global.get_name().to_str().is_ok_and(|name| name.contains(".str")) {
+        if cfg.only_dot_str && !global.get_name().to_str().is_ok_and(|name| name.starts_with(".str")) {
+            continue;
+        }
+        if global_has_unsupported_user(&global) {
             continue;
         }
         let Some(BasicValueEnum::ArrayValue(array)) = global.get_initializer() else {
             continue;
         };
-        if !array.is_const_string() || array.is_undef() || array.is_null() {
+        if array.is_undef() || array.is_null() {
             continue;
         }
-        let Some(bytes) = array_as_const_string(&array) else {
+        let Some((bytes, elem_size)) = array_as_const_string_bytes(&array) else {
             continue;
         };
-        let text = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+        let text = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
         if bytes.len() <= 1
             || bytes.len() > MAX_STRING_BYTES
-            || std::str::from_utf8(text).is_err()
-            || text
-                .iter()
-                .any(|byte| byte.is_ascii_control() && !matches!(byte, b'\n' | b'\r' | b'\t'))
+            || (elem_size == 1
+                && (std::str::from_utf8(text).is_err()
+                    || text
+                        .iter()
+                        .any(|byte| byte.is_ascii_control() && !matches!(byte, b'\n' | b'\r' | b'\t'))))
         {
             info!("(strenc) skipped {:?}: not a supported text array", global.get_name());
             continue;
@@ -349,7 +472,8 @@ fn collect_string_candidates<'a>(module: &Module<'a>, cfg: &StringEncryptionConf
             let mut complete = true;
             while let Some(current) = use_value {
                 use_value = current.get_next_use();
-                if collect_insert_points(global, current.get_user(), &mut users).is_err() {
+                // Walk raw values: inkwell cannot classify token-valued EH users.
+                if collect_insert_points(global, unsafe { LLVMGetUser(current.as_mut_ptr()) }, &mut users).is_err() {
                     complete = false;
                     break;
                 }
@@ -366,23 +490,24 @@ fn collect_string_candidates<'a>(module: &Module<'a>, cfg: &StringEncryptionConf
         }
         candidates.push(StringCandidate {
             global,
-            bytes: bytes.to_vec(),
+            bytes,
+            elem_size,
             users,
         });
     }
     candidates
 }
 
-pub(crate) fn collect_insert_points<'a>(
+pub(crate) fn collect_insert_points(
     _string_global: GlobalValue,
-    user: AnyValueEnum<'a>,
+    user: LLVMValueRef,
     output: &mut Vec<(LLVMValueRef, u32)>,
 ) -> anyhow::Result<()> {
     use inkwell::llvm_sys::LLVMLinkage;
     use inkwell::llvm_sys::core::{LLVMGetLinkage, LLVMGetSection};
 
     let mut visited = std::collections::HashSet::new();
-    let mut worklist = vec![user.as_value_ref()];
+    let mut worklist = vec![user];
     while let Some(value) = worklist.pop() {
         if !visited.insert(value) {
             continue;

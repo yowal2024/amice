@@ -2,6 +2,7 @@ use inkwell::llvm_sys::prelude::{LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
 
 #[link(name = "amice-llvm-ffi")]
 unsafe extern "C" {
+    pub(crate) fn amice_module_invalidate_memory_attrs_for_volatile(module: LLVMModuleRef);
     #[cfg(any(
         feature = "llvm12-0",
         feature = "llvm13-0",
@@ -14,6 +15,7 @@ unsafe extern "C" {
         feature = "llvm20-1",
         feature = "llvm21-1",
         feature = "llvm22-1",
+        feature = "llvm23-1",
     ))]
     pub(crate) fn amice_module_append_to_global_ctors(module: LLVMModuleRef, function: LLVMValueRef, priority: i32);
 

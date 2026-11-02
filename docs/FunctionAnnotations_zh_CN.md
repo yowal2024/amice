@@ -1,6 +1,27 @@
 # 函数注解（FunctionAnnotation）
 
-源代码内的`annotate`的优先级永远高于环境变量/配置文件，~~但是低于脚本配置~~。
+[English](FunctionAnnotations_en_US.md) | 简体中文
+
+对支持函数注解的 Pass，优先级为 **函数注解 > 环境变量 > 配置文件 > 默认值**。`AMICE_PASS_ORDER` 是更外层的 Pass 允许列表：没有列入的 Pass 不会因为函数注解而重新运行。
+
+## C/C++ 最小示例
+
+```c
+__attribute__((noinline, annotate("+flatten,flatten_mode=basic")))
+int protected_function(int x) {
+    if (x > 10) return x * 3;
+    return x + 7;
+}
+
+__attribute__((noinline, annotate("-flatten")))
+int excluded_function(int x) {
+    return x + 1;
+}
+```
+
+按 [快速上手](QuickStart_zh_CN.md) 加载插件编译包含这些函数的完整程序。即使全局未开启 Flatten，第一个函数也会请求启用；全局开启时，第二个函数请求排除。`noinline` 用于帮助保留演示函数，不保证函数一定满足该 Pass 的支持条件。
+
+字符串加密目前使用全局配置，没有可用的逐函数注解覆盖。Rust 接入见 [Rust 使用说明](RustUsage_zh_CN.md)，不要直接使用上述 C 属性语法。
 
 ## 配置表达式
 
@@ -10,12 +31,11 @@
 
 ### 键值表达式
 
-`^key=value`传递一个键值对，当然你也可以写为`key=value`或者(`+key=value`/`-key=value`)，
-最好按照正常情况来编写，否则可能出问题！
+`^key=value` 传递一个键值对，也可以写作 `key=value` 或 `+key=value` / `-key=value`。推荐使用 `^key=value` 或 `key=value` 这类常规写法。
 
-> 特殊情况: `+flag` = `+flag=yes` = `+flag=1` = `+flag=true`
-> </br> = `^flag=yes` = `^flag=1` = `^flag=true`
-> </br> = `flag=yes` = `flag=1` = `flag=true`
+> 特殊情况：`+flag` = `+flag=yes` = `+flag=1` = `+flag=true`，
+> 亦等价于 `^flag=yes` = `^flag=1` = `^flag=true`
+> 和 `flag=yes` = `flag=1` = `flag=true`。
 
 ## 可用的混淆
 
@@ -60,32 +80,20 @@
         - 默认值：16
         - 影响：数值越小，分片越保守；数值越大，可能提取更大的基础块为独立函数
 
-### 伪造控制流（Bogus Control Flow / BCF）
+### 虚假控制流（Bogus Control Flow / BCF）
 
-通过在基本块间插入无效或等价分支。
+以下注解用于逐函数启用 BCF、调整预算或覆盖全局配置。整函数克隆与强制内联可单独关闭，整数区域变换仍保留。支持范围与限制见 [环境变量配置](EnvConfig_zh_CN.md#虚假控制流混淆)。
 
-- 开关
-    - `+bogus_control_flow`（别名：`+bcf`）
-        - 功能：启用伪造控制流
-        - 默认值：false
+| 注解 | 别名 | 默认值与含义 |
+|---|---|---|
+| `+bogus_control_flow` | `+bcf`, `+boguscfg` | 默认关闭；`-bcf` 可逐函数关闭 |
+| `bogus_control_flow_prob=<n>` | `bcf_prob` | 80；整函数克隆及候选区域的选择概率，上限 100 |
+| `+bogus_control_flow_clone` | `+bcf_clone` | 默认启用；`-bcf_clone` 只关闭整函数克隆补充 |
+| `bogus_control_flow_max_regions=<n>` | `bcf_max_regions` | 2；每函数区域数，0 禁用，硬上限 16 |
+| `bogus_control_flow_max_region_instructions=<n>` | `bcf_max_region_instructions` | 8；每区域原始指令数，小于 2 不转换，硬上限 16 |
+| `bogus_control_flow_seed=<n>` | `bcf_seed` | 继承全局种子，未配置时随机生成；u64 十进制种子 |
 
-- 模式
-    - `bogus_control_flow_mode=<mode>`（别名：`bcf_mode`）
-        - 可选值：
-            - `basic`（别名：`v1`）
-            - `polaris-primes`（别名：`primes`, `v2`）
-        - 默认值：`basic`
-        - 说明：不同模式生成伪造路径的策略不同，可根据需求选择
-
-- 参数
-    - `bogus_control_flow_prob=<0..100>`（别名：`bcf_prob`）
-        - 功能：每个基本块被混淆（应用伪造分支）的概率，单位为百分比
-        - 默认值：80
-        - 范围与行为：0–100；超过上限将按 100 处理，非法值忽略并保留原值/默认值
-    - `bogus_control_flow_loops=<n>`（别名：`bcf_loops`）
-        - 功能：对同一函数重复执行该混淆 Pass 的次数
-        - 默认值：1
-        - 要求：n ≥ 1；小于 1 或非法值将忽略并保留原值/默认值
+例如：`__attribute__((annotate("+bcf bcf_prob=100 bcf_max_regions=1 bcf_max_region_instructions=6 bcf_seed=42")))`。
 
 ### 常参特化克隆（Clone Function）
 
@@ -194,7 +202,7 @@
 
 ### Switch 降级（Lower Switch / Switch→If-Else）
 
-将 switch 语句预先降级为 if-else 链，便于后续混淆变换（如扁平化、伪造控制流）。
+将 switch 语句预先降级为 if-else 链，便于后续混淆变换（如扁平化、虚假控制流）。
 
 - 开关
     - `+lower_switch`（别名：`+lowerswitch`, `+switch_to_if`）
@@ -206,7 +214,7 @@
 将算术/逻辑运算替换为等价的 MBA 表达式。
 
 - 开关
-    - `+mba`（别名：`+linearmba`）
+    - `+mba`；可选 `-mba_float_regions`、`-mba_pre_expand`、`-mba_opaque_guard`、`mba_max_instructions=32`、`mba_max_added_instructions=512`
         - 功能：启用 MBA 重写
         - 默认值：false
 
@@ -243,11 +251,33 @@
         - 默认值：3
         - 建议：值越大，块数量与跳转增多，体积与编译/优化时间也会上升
 
-### 虚拟机扁平化（VM Flatten / VMF）
+### VM控制流平坦化（VM Flatten / VMF）
 
-将目标函数改写为由“虚拟机解释器 + 字节码/指令表”驱动的控制流形式。
+混淆目标函数的控制流，增加逆向分析难度。
 
 - 开关
     - `+vm_flatten`（别名：`+vmf`）
-        - 功能：启用基于虚拟机的控制流扁平化
+        - 功能：启用VM控制流平坦化
         - 默认值：false
+
+- `+vm_flatten_distributed`（别名 `+vmf_distributed`）：启用分散跳转原型，默认 false；需同时启用 `+vmf`。
+- `vm_flatten_max_ops=8`（别名 `vmf_max_ops`）：分散模式每个跳转点生成 1～n 个可逆索引操作，必含一次 S-box 替换，n 限制在 1～32；地址解码另计。
+- `vm_flatten_program_variants=3`（别名 `vmf_program_variants`）：每个跳转点交错生成的索引程序数量，限制在 1～3；值越大，体积与编译/优化开销越高。
+- `vm_flatten_seed=42`（别名 `vmf_seed`）：分散模式随机种子；默认随机，显式指定（包括 0）可复现。
+
+示例：`annotate("+vmf,+vmf_distributed,vmf_max_ops=8,vmf_program_variants=3,vmf_seed=42")`。VM控制流平坦化在虚假控制流之后执行。分散模式的 PHI、优化和适用范围说明见[环境配置](EnvConfig_zh_CN.md#vm控制流平坦化)。
+
+### 指令级 VMP（VmVirtualize）
+
+- `+vm_virtualize`（别名 `+vmp`）：对当前函数启用 VMP；默认 false。
+- `vm_profile_path=/absolute/path/to/profile`（别名 `vm_profile`）：选择 profile package；未设置时用内置 `amice-simple-vmp`。
+- `vm_runtime_scope=func` 或 `module`：覆盖 profile 的 runtime scope。
+
+```c
+__attribute__((noinline, annotate("+vm_virtualize,vm_runtime_scope=func")))
+int sensitive(int x) {
+    return (x * 7) ^ 0x55;
+}
+```
+
+不支持的函数会保留原实现；使用 `RUST_LOG=amice=debug` 查看跳过原因。先在一个函数上验证，再扩大范围；不要把“启用 VMP”理解为所有函数一定被虚拟化。profile 的实现约束见 [VMP 设计](VMPDesign_zh_CN.md)。

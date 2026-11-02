@@ -18,8 +18,7 @@ use common::{CppCompileBuilder, ObfuscationConfig, ensure_plugin_built, fixture_
 fn test_cpp_exception_with_bcf() {
     ensure_plugin_built();
 
-    // This is a CRITICAL test - BCF currently does NOT check for exception handling
-    // This test will likely FAIL or produce incorrect results
+    // Region BCF skips personality/EH functions and preserves unwinding behavior.
     let result = CppCompileBuilder::new(
         fixture_path("exception_handling", "cpp_exception_bcf.cpp", Language::Cpp),
         "cpp_exception_bcf",
@@ -128,6 +127,48 @@ fn test_cpp_exception_with_function_wrapper() {
         function_wrapper: Some(true),
         ..ObfuscationConfig::disabled()
     })
+    .compile();
+
+    result.assert_success();
+    let run = result.run();
+    run.assert_success();
+}
+
+#[test]
+fn test_cpp_exception_with_alias_access() {
+    ensure_plugin_built();
+
+    // AliasAccess skips functions containing exception handling: the catchpad
+    // catch-object storage must stay an alloca because the runtime writes it
+    // via the fixed frame offset in the EH tables (issue #102).
+    let result = CppCompileBuilder::new(
+        fixture_path("exception_handling", "cpp_exception_alias_access.cpp", Language::Cpp),
+        "cpp_exception_alias_access",
+    )
+    .config(ObfuscationConfig {
+        alias_access: Some(true),
+        ..ObfuscationConfig::disabled()
+    })
+    .compile();
+
+    result.assert_success();
+    let run = result.run();
+    run.assert_success();
+}
+
+#[test]
+fn test_cpp_exception_with_alias_access_optimized() {
+    ensure_plugin_built();
+
+    let result = CppCompileBuilder::new(
+        fixture_path("exception_handling", "cpp_exception_alias_access.cpp", Language::Cpp),
+        "cpp_exception_alias_access_o2",
+    )
+    .config(ObfuscationConfig {
+        alias_access: Some(true),
+        ..ObfuscationConfig::disabled()
+    })
+    .optimization("O2")
     .compile();
 
     result.assert_success();

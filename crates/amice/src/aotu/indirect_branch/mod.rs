@@ -1,7 +1,7 @@
 use crate::config::{Config, IndirectBranchConfig, IndirectBranchFlags};
 use crate::pass_registry::{AmiceFunctionPass, AmicePass, AmicePassFlag};
 use amice_llvm::const_array;
-use amice_llvm::inkwell2::{BasicBlockExt, BuilderExt, FunctionExt, InstructionExt, ModuleExt, VerifyResult};
+use amice_llvm::inkwell2::{BasicBlockExt, BuilderExt, FunctionExt, InstructionExt, VerifyResult, is_branch_opcode};
 use amice_llvm::ptr_type;
 use amice_macro::amice;
 use amice_plugin::inkwell::basic_block::BasicBlock;
@@ -56,7 +56,10 @@ impl AmicePass for IndirectBranch {
             }
 
             if x.count_basic_blocks() < 3 {
-                log::info!("(IndirectBranch) skipping {:?}: fewer than two non-entry destinations", x.get_name());
+                log::info!(
+                    "(IndirectBranch) skipping {:?}: fewer than two non-entry destinations",
+                    x.get_name()
+                );
                 continue;
             }
             if x.get_basic_blocks().iter().any(|block| {
@@ -76,7 +79,10 @@ impl AmicePass for IndirectBranch {
                     )
                 })
             }) {
-                log::info!("(IndirectBranch) skipping {:?}: unsupported EH or indirect terminator", x.get_name());
+                log::info!(
+                    "(IndirectBranch) skipping {:?}: unsupported EH or indirect terminator",
+                    x.get_name()
+                );
                 continue;
             }
             // Extra legal destinations create CFG edges even though the table
@@ -129,8 +135,6 @@ impl AmicePass for IndirectBranch {
         global_indirect_branch_table.set_linkage(Linkage::Internal);
         global_indirect_branch_table.set_constant(true);
 
-        module.append_to_compiler_used(global_indirect_branch_table);
-
         let encrypt_key_global = if self
             .default_config
             .flags
@@ -149,8 +153,6 @@ impl AmicePass for IndirectBranch {
             table.set_linkage(Linkage::Private);
             table.set_constant(false);
 
-            module.append_to_compiler_used(table);
-
             Some(table)
         } else {
             None
@@ -165,7 +167,7 @@ impl AmicePass for IndirectBranch {
             let mut branch_instructions = Vec::new();
             for basic_block in function.get_basic_blocks() {
                 for instruction in basic_block.get_instructions() {
-                    if instruction.get_opcode() == InstructionOpcode::Br {
+                    if is_branch_opcode(instruction.get_opcode()) {
                         branch_instructions.push(instruction.into_branch_inst());
                     }
                 }
@@ -214,8 +216,6 @@ impl AmicePass for IndirectBranch {
                         local_indirect_branch_table.set_initializer(&initializer);
                         local_indirect_branch_table.set_linkage(Linkage::Private);
                         local_indirect_branch_table.set_constant(true);
-
-                        module.append_to_compiler_used(local_indirect_branch_table);
 
                         Some(local_indirect_branch_table)
                     } else {
@@ -322,7 +322,11 @@ impl AmicePass for IndirectBranch {
                     .set_volatile(true)?;
                 // A singleton destination list lets LLVM replace indirectbr
                 // with br regardless of the volatile target load.
-                let destinations = if is_conditional { &successors } else { &function_destinations };
+                let destinations = if is_conditional {
+                    &successors
+                } else {
+                    &function_destinations
+                };
                 let Ok(mut indir_br) = builder
                     .build_indirect_branch(loaded_address.as_basic_value_enum(), destinations)
                     .map_err(|e| error!("build indirect branch failed: {e}"))
@@ -430,7 +434,7 @@ fn collect_basic_block<'a>(funcs: &Vec<(FunctionValue<'a>, IndirectBranchConfig)
                 continue;
             }
 
-            // Skip blocks that end with unreachable (e.g., fake blocks from BCF)
+            // Skip blocks that end with unreachable.
             // if let Some(terminator) = bb.get_terminator() {
             //     if terminator.get_opcode() == InstructionOpcode::Unreachable {
             //         continue;

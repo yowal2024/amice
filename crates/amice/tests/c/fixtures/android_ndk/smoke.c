@@ -1,0 +1,23 @@
+#include <stdio.h>
+#include <stdlib.h>
+
+__attribute__((noinline))
+static unsigned retain_value(unsigned value, unsigned salt, unsigned mirror) {
+    return (value + salt) - mirror;
+}
+
+__attribute__((noinline, annotate("+flatten,+split_basic_block,+mba")))
+static unsigned transform(unsigned value) {
+    if (value & 1)
+        value = (value * 7) ^ 0x55;
+    else
+        value = (value + 11) ^ 0x33;
+    return retain_value(value, 17, 17) + 17;
+}
+
+int main(int argc, char **argv) {
+    unsigned value = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 7;
+    puts("AMICE_NDK_C_MARKER");
+    printf("%u\n", transform(value));
+    return 0;
+}

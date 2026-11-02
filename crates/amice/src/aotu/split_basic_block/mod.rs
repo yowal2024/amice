@@ -1,6 +1,6 @@
 use crate::config::{Config, SplitBasicBlockConfig};
 use crate::pass_registry::{AmiceFunctionPass, AmicePass, AmicePassFlag};
-use amice_llvm::inkwell2::{BasicBlockExt, FunctionExt};
+use amice_llvm::inkwell2::{BasicBlockExt, FunctionExt, is_branch_opcode};
 use amice_macro::amice;
 use amice_plugin::PreservedAnalyses;
 use amice_plugin::inkwell::basic_block::BasicBlock;
@@ -11,7 +11,10 @@ use log::{Level, log_enabled};
 use rand::seq::SliceRandom;
 
 #[amice(
-    priority = 980,
+    // Flatten must run before SplitBasicBlock. Splitting first creates many
+    // cross-block SSA uses which make Flatten's register-to-stack repair
+    // pathological on real-world C++ translation units.
+    priority = 958,
     name = "SplitBasicBlock",
     flag = AmicePassFlag::PipelineStart | AmicePassFlag::OptimizerLast | AmicePassFlag::FunctionLevel,
     config = SplitBasicBlockConfig,
@@ -160,16 +163,19 @@ fn first_non_alloca_index(bb: &BasicBlock<'_>) -> u32 {
 }
 
 fn is_terminator_instruction(inst: &amice_plugin::inkwell::values::InstructionValue) -> bool {
-    matches!(
-        inst.get_opcode(),
-        InstructionOpcode::Return
-            | InstructionOpcode::Br
-            | InstructionOpcode::Switch
-            | InstructionOpcode::IndirectBr
-            | InstructionOpcode::Invoke
-            | InstructionOpcode::Resume
-            | InstructionOpcode::Unreachable
-    )
+    let opcode = inst.get_opcode();
+    // LLVM 23 splits the `br` opcode into unconditional and conditional
+    // variants, so branch terminators go through `is_branch_opcode`.
+    opcode == InstructionOpcode::Return
+        || is_branch_opcode(opcode)
+        || matches!(
+            opcode,
+            InstructionOpcode::Switch
+                | InstructionOpcode::IndirectBr
+                | InstructionOpcode::Invoke
+                | InstructionOpcode::Resume
+                | InstructionOpcode::Unreachable
+        )
 }
 
 fn flitter_basic_block(bb: &BasicBlock<'_>, split_num: u32, is_entry: bool, x: &mut u32) -> bool {
